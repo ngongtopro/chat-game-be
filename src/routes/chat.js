@@ -53,7 +53,15 @@ router.get("/conversations", authMiddleware, async (req, res) => {
               u.username,
               u.avatar_url,
               last_message,
-              last_message_time
+              last_message_time,
+              COALESCE(
+                (SELECT COUNT(*) 
+                 FROM chat_messages 
+                 WHERE sender_id = other_user_id 
+                   AND receiver_id = $1 
+                   AND is_read = false
+                ), 0
+              ) as unread_count
        FROM (
          SELECT 
            CASE 
@@ -75,6 +83,25 @@ router.get("/conversations", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("[v0] Get conversations error:", error)
     res.status(500).json({ error: "Failed to get conversations" })
+  }
+})
+
+// Mark messages as read
+router.post("/mark-read", authMiddleware, async (req, res) => {
+  try {
+    const { friendId } = req.body
+
+    await query(
+      `UPDATE chat_messages 
+       SET is_read = true 
+       WHERE sender_id = $1 AND receiver_id = $2 AND is_read = false`,
+      [friendId, req.userId],
+    )
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("[v0] Mark read error:", error)
+    res.status(500).json({ error: "Failed to mark messages as read" })
   }
 })
 

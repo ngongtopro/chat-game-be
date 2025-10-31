@@ -80,7 +80,8 @@ router.post("/accept", authMiddleware, async (req, res) => {
 // Get friends list
 router.get("/list", authMiddleware, async (req, res) => {
   try {
-    const result = await query(
+    // Get accepted friends
+    const friendsResult = await query(
       `SELECT u.id, u.username, u.email, u.avatar_url, f.status, f.created_at
        FROM friendships f
        JOIN users u ON (
@@ -93,7 +94,29 @@ router.get("/list", authMiddleware, async (req, res) => {
       [req.userId],
     )
 
-    res.json({ friends: result.rows })
+    // Get pending requests (received)
+    const pendingResult = await query(
+      `SELECT u.id, u.username, u.email, u.avatar_url, f.created_at
+       FROM friendships f
+       JOIN users u ON u.id = f.user_id
+       WHERE f.friend_id = $1 AND f.status = 'pending'`,
+      [req.userId],
+    )
+
+    // Get sent requests
+    const sentResult = await query(
+      `SELECT u.id, u.username, u.email, u.avatar_url, f.created_at
+       FROM friendships f
+       JOIN users u ON u.id = f.friend_id
+       WHERE f.user_id = $1 AND f.status = 'pending'`,
+      [req.userId],
+    )
+
+    res.json({ 
+      friends: friendsResult.rows,
+      pendingRequests: pendingResult.rows,
+      sentRequests: sentResult.rows
+    })
   } catch (error) {
     console.error("[v0] Get friends error:", error)
     res.status(500).json({ error: "Failed to get friends" })
@@ -115,6 +138,42 @@ router.get("/requests", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("[v0] Get requests error:", error)
     res.status(500).json({ error: "Failed to get friend requests" })
+  }
+})
+
+// Reject friend request
+router.post("/reject", authMiddleware, async (req, res) => {
+  try {
+    const { friendId } = req.body
+
+    await query(
+      `DELETE FROM friendships 
+       WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'`,
+      [friendId, req.userId],
+    )
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("[v0] Reject friend error:", error)
+    res.status(500).json({ error: "Failed to reject friend request" })
+  }
+})
+
+// Remove friend
+router.post("/remove", authMiddleware, async (req, res) => {
+  try {
+    const { friendId } = req.body
+
+    await query(
+      `DELETE FROM friendships 
+       WHERE (user_id = $1 AND friend_id = $2) OR (user_id = $2 AND friend_id = $1)`,
+      [req.userId, friendId],
+    )
+
+    res.json({ success: true })
+  } catch (error) {
+    console.error("[v0] Remove friend error:", error)
+    res.status(500).json({ error: "Failed to remove friend" })
   }
 })
 
