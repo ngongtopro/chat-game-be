@@ -13,7 +13,10 @@ router.get("/balance", authMiddleware, async (req, res) => {
       return res.status(404).json({ error: "Wallet not found" })
     }
 
-    res.json({ wallet: result.rows[0] })
+    res.json({ 
+      wallet: result.rows[0],
+      balance: parseFloat(result.rows[0].balance)
+    })
   } catch (error) {
     console.error("[v0] Get balance error:", error)
     res.status(500).json({ error: "Failed to get balance" })
