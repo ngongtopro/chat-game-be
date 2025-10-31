@@ -23,7 +23,7 @@ async function setupDatabase() {
     // Read and execute initial schema
     console.log("📋 Đang tạo các bảng...")
     const schemaSQL = fs.readFileSync(
-      path.join(__dirname, "..", "scripts", "001_initial_schema.sql"),
+      path.join(__dirname, "scripts", "001_initial_schema.sql"),
       "utf8"
     )
     await client.query(schemaSQL)
@@ -32,7 +32,7 @@ async function setupDatabase() {
     // Read and execute seed data
     console.log("🌱 Đang thêm dữ liệu mẫu...")
     const seedSQL = fs.readFileSync(
-      path.join(__dirname, "..", "scripts", "002_seed_plants.sql"),
+      path.join(__dirname, "scripts", "002_seed_plants.sql"),
       "utf8"
     )
     await client.query(seedSQL)
