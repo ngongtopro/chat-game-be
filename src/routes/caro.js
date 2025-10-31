@@ -13,7 +13,7 @@ router.post("/create-room", authMiddleware, async (req, res) => {
     const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase()
 
     const result = await query(
-      `INSERT INTO caro_games (room_code, player1_id, bet_amount, status) 
+      `INSERT INTO caro_rooms (room_code, player1_id, bet_amount, status) 
        VALUES ($1, $2, $3, 'waiting') 
        RETURNING *`,
       [roomCode, req.userId, betAmount],
@@ -36,7 +36,7 @@ router.post("/join-room", authMiddleware, async (req, res) => {
     await client.query("BEGIN")
 
     // Get room info
-    const roomResult = await client.query("SELECT * FROM caro_games WHERE room_code = $1 AND status = $2", [
+    const roomResult = await client.query("SELECT * FROM caro_rooms WHERE room_code = $1 AND status = $2", [
       roomCode,
       "waiting",
     ])
@@ -55,7 +55,7 @@ router.post("/join-room", authMiddleware, async (req, res) => {
 
     // Update room
     const updatedRoom = await client.query(
-      `UPDATE caro_games 
+      `UPDATE caro_rooms 
        SET player2_id = $1, status = 'playing', started_at = NOW()
        WHERE room_code = $2
        RETURNING *`,
@@ -85,7 +85,7 @@ router.get("/room/:roomCode", authMiddleware, async (req, res) => {
               u2.username as player2_username, u2.avatar_url as player2_avatar,
               cs1.games_won as player1_wins, cs1.games_played as player1_games, cs1.level as player1_level,
               cs2.games_won as player2_wins, cs2.games_played as player2_games, cs2.level as player2_level
-       FROM caro_games cg
+       FROM caro_rooms cg
        JOIN users u1 ON cg.player1_id = u1.id
        LEFT JOIN users u2 ON cg.player2_id = u2.id
        LEFT JOIN caro_stats cs1 ON cg.player1_id = cs1.user_id
@@ -111,7 +111,7 @@ router.post("/move", authMiddleware, async (req, res) => {
     const { roomCode, x, y, board } = req.body
 
     // Get room
-    const roomResult = await query("SELECT * FROM caro_games WHERE room_code = $1", [roomCode])
+    const roomResult = await query("SELECT * FROM caro_rooms WHERE room_code = $1", [roomCode])
 
     if (roomResult.rows.length === 0) {
       return res.status(404).json({ error: "Room not found" })
@@ -120,7 +120,7 @@ router.post("/move", authMiddleware, async (req, res) => {
     const room = roomResult.rows[0]
 
     // Update board state
-    await query("UPDATE caro_games SET board_state = $1, current_turn = $2 WHERE room_code = $3", [
+    await query("UPDATE caro_rooms SET board_state = $1, current_turn = $2 WHERE room_code = $3", [
       JSON.stringify(board),
       room.current_turn === "player1" ? "player2" : "player1",
       roomCode,
@@ -138,16 +138,16 @@ router.get("/rooms", authMiddleware, async (req, res) => {
   try {
     const result = await query(
       `SELECT cg.*, u.username as player1_username
-       FROM caro_games cg
+       FROM caro_rooms cg
        JOIN users u ON cg.player1_id = u.id
        WHERE cg.status = 'waiting'
        ORDER BY cg.created_at DESC
        LIMIT 20`,
     )
-
+    console.log("[v0] Fetched rooms:", result.rows)
     res.json({ rooms: result.rows })
   } catch (error) {
-    console.error("[v0] Get rooms error:", error)
+    console.error("Get rooms error:", error)
     res.status(500).json({ error: "Failed to get rooms" })
   }
 })
