@@ -4,19 +4,32 @@ const { query } = require("./db")
 function setupSocketHandlers(io) {
   // Authentication middleware for socket connections
   io.use((socket, next) => {
-    const token = socket.handshake.auth.token
+    // Try to get token from auth (sent by client)
+    let token = socket.handshake.auth.token
+
+    // If no token in auth, try to get from cookies
+    if (!token && socket.handshake.headers.cookie) {
+      const cookies = socket.handshake.headers.cookie.split(';')
+      const tokenCookie = cookies.find(c => c.trim().startsWith('token='))
+      if (tokenCookie) {
+        token = tokenCookie.split('=')[1]
+      }
+    }
 
     if (!token) {
+      console.log("[Socket] No token provided in handshake or cookies")
       return next(new Error("Authentication required"))
     }
 
     const decoded = verifyToken(token)
 
     if (!decoded) {
+      console.log("[Socket] Invalid token")
       return next(new Error("Invalid token"))
     }
 
     socket.userId = decoded.userId
+    console.log(`[Socket] User authenticated: ${socket.userId}`)
     next()
   })
 
@@ -32,25 +45,27 @@ function setupSocketHandlers(io) {
     })
 
     // Chat events
-    socket.on("chat:join", (friendId) => {
-      const roomId = [socket.userId, friendId].sort().join(":")
-      socket.join(`chat:${roomId}`)
+    socket.on("join-chat", (chatId) => {
+      socket.join(`chat:${chatId}`)
+      console.log(`[v0] User ${socket.userId} joined chat: ${chatId}`)
     })
 
-    socket.on("chat:message", async (data) => {
-      const { friendId, message } = data
-      const roomId = [socket.userId, friendId].sort().join(":")
+    socket.on("leave-chat", (chatId) => {
+      socket.leave(`chat:${chatId}`)
+      console.log(`[v0] User ${socket.userId} left chat: ${chatId}`)
+    })
 
-      try {
-        const result = await query(
-          "INSERT INTO chat_messages (sender_id, receiver_id, message) VALUES ($1, $2, $3) RETURNING *",
-          [socket.userId, friendId, message],
-        )
+    socket.on("send-message", async (data) => {
+      const { chatId, message } = data
+      // Broadcast to all users in the chat room
+      socket.to(`chat:${chatId}`).emit("message-received", message)
+      console.log(`[v0] Message sent to chat: ${chatId}`)
+    })
 
-        io.to(`chat:${roomId}`).emit("chat:new_message", result.rows[0])
-      } catch (error) {
-        console.error("[v0] Chat message error:", error)
-      }
+    socket.on("typing", (data) => {
+      const { chatId } = data
+      // Broadcast typing indicator to other users in the chat
+      socket.to(`chat:${chatId}`).emit("user-typing")
     })
 
     // Caro game events
