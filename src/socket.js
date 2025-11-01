@@ -1,6 +1,9 @@
 const { verifyToken } = require("./auth")
 const { query } = require("./db")
 
+// Store online users: userId -> socketId
+const onlineUsers = new Map()
+
 function setupSocketHandlers(io) {
   // Authentication middleware for socket connections
   io.use((socket, next) => {
@@ -33,11 +36,49 @@ function setupSocketHandlers(io) {
     next()
   })
 
-  io.on("connection", (socket) => {
+  io.on("connection", async (socket) => {
     console.log(`[v0] User connected: ${socket.userId}`)
+
+    // Check if user is already connected, disconnect old session
+    if (onlineUsers.has(socket.userId)) {
+      const oldSocketId = onlineUsers.get(socket.userId)
+      const oldSocket = io.sockets.sockets.get(oldSocketId)
+      if (oldSocket) {
+        console.log(`[Socket] User ${socket.userId} already connected, disconnecting old session`)
+        oldSocket.emit("force-disconnect", { 
+          reason: "Login from another device/browser" 
+        })
+        oldSocket.disconnect(true)
+      }
+    }
+
+    // Add user to online users
+    onlineUsers.set(socket.userId, socket.id)
 
     // Join user's personal room
     socket.join(`user:${socket.userId}`)
+
+    // Get user's friends and notify them
+    try {
+      const friendsResult = await query(
+        `SELECT CASE 
+          WHEN user_id = $1 THEN friend_id 
+          ELSE user_id 
+        END as friend_id 
+        FROM friendships 
+        WHERE (user_id = $1 OR friend_id = $1) AND status = 'accepted'`,
+        [socket.userId]
+      )
+      
+      // Notify all friends that this user is online
+      friendsResult.rows.forEach(row => {
+        io.to(`user:${row.friend_id}`).emit("user-online", { userId: socket.userId })
+      })
+
+      console.log(`[Socket] User ${socket.userId} is now online, notified ${friendsResult.rows.length} friends`)
+    } catch (error) {
+      console.error("[Socket] Error notifying friends:", error)
+    }
 
     // Farm events
     socket.on("farm:update", async (data) => {
@@ -83,10 +124,35 @@ function setupSocketHandlers(io) {
       io.to(`caro:${roomCode}`).emit("caro:game_ended", { winner })
     })
 
-    socket.on("disconnect", () => {
+    socket.on("disconnect", async () => {
       console.log(`[v0] User disconnected: ${socket.userId}`)
+      
+      // Remove user from online users
+      onlineUsers.delete(socket.userId)
+
+      // Get user's friends and notify them
+      try {
+        const friendsResult = await query(
+          `SELECT CASE 
+            WHEN user_id = $1 THEN friend_id 
+            ELSE user_id 
+          END as friend_id 
+          FROM friendships 
+          WHERE (user_id = $1 OR friend_id = $1) AND status = 'accepted'`,
+          [socket.userId]
+        )
+        
+        // Notify all friends that this user is offline
+        friendsResult.rows.forEach(row => {
+          io.to(`user:${row.friend_id}`).emit("user-offline", { userId: socket.userId })
+        })
+
+        console.log(`[Socket] User ${socket.userId} is now offline, notified ${friendsResult.rows.length} friends`)
+      } catch (error) {
+        console.error("[Socket] Error notifying friends on disconnect:", error)
+      }
     })
   })
 }
 
-module.exports = { setupSocketHandlers }
+module.exports = { setupSocketHandlers, onlineUsers }

@@ -1,6 +1,7 @@
 const express = require("express")
 const { query } = require("../db")
 const { authMiddleware } = require("../auth")
+const { onlineUsers } = require("../socket")
 
 const router = express.Router()
 
@@ -112,6 +113,32 @@ router.post("/mark-read", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("[v0] Mark read error:", error)
     res.status(500).json({ error: "Failed to mark messages as read" })
+  }
+})
+
+// Get online users (friends only)
+router.get("/online-users", authMiddleware, async (req, res) => {
+  try {
+    // Get user's friends
+    const friendsResult = await query(
+      `SELECT CASE 
+        WHEN user_id = $1 THEN friend_id 
+        ELSE user_id 
+      END as friend_id 
+      FROM friendships 
+      WHERE (user_id = $1 OR friend_id = $1) AND status = 'accepted'`,
+      [req.userId]
+    )
+
+    // Check which friends are online
+    const onlineFriendIds = friendsResult.rows
+      .map(row => row.friend_id)
+      .filter(friendId => onlineUsers.has(friendId))
+
+    res.json({ onlineUsers: onlineFriendIds })
+  } catch (error) {
+    console.error("[v0] Get online users error:", error)
+    res.status(500).json({ error: "Failed to get online users" })
   }
 })
 
