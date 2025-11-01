@@ -47,35 +47,45 @@ router.post("/send", authMiddleware, async (req, res) => {
 // Get conversations list
 router.get("/conversations", authMiddleware, async (req, res) => {
   try {
+    // Get all friends with their last messages (if any)
     const result = await query(
-      `SELECT DISTINCT ON (other_user_id)
-              other_user_id as friend_id,
-              u.username,
-              u.avatar_url,
-              last_message,
-              last_message_time,
-              COALESCE(
-                (SELECT COUNT(*) 
-                 FROM chat_messages 
-                 WHERE sender_id = other_user_id 
-                   AND receiver_id = $1 
-                   AND is_read = false
-                ), 0
-              ) as unread_count
-       FROM (
-         SELECT 
-           CASE 
-             WHEN sender_id = $1 THEN receiver_id 
-             ELSE sender_id 
-           END as other_user_id,
-           message as last_message,
-           created_at as last_message_time
-         FROM chat_messages
-         WHERE sender_id = $1 OR receiver_id = $1
-         ORDER BY created_at DESC
-       ) conversations
-       JOIN users u ON u.id = other_user_id
-       ORDER BY other_user_id, last_message_time DESC`,
+      `SELECT 
+         CASE 
+           WHEN f.user_id = $1 THEN f.friend_id
+           ELSE f.user_id
+         END as friend_id,
+         u.username,
+         u.avatar_url,
+         (
+           SELECT message 
+           FROM chat_messages 
+           WHERE (sender_id = $1 AND receiver_id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END)
+              OR (sender_id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END AND receiver_id = $1)
+           ORDER BY created_at DESC 
+           LIMIT 1
+         ) as last_message,
+         (
+           SELECT created_at 
+           FROM chat_messages 
+           WHERE (sender_id = $1 AND receiver_id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END)
+              OR (sender_id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END AND receiver_id = $1)
+           ORDER BY created_at DESC 
+           LIMIT 1
+         ) as last_message_time,
+         (
+           SELECT COUNT(*) 
+           FROM chat_messages 
+           WHERE sender_id = CASE WHEN f.user_id = $1 THEN f.friend_id ELSE f.user_id END
+             AND receiver_id = $1 
+             AND is_read = false
+         ) as unread_count
+       FROM friendships f
+       JOIN users u ON u.id = CASE 
+         WHEN f.user_id = $1 THEN f.friend_id
+         ELSE f.user_id
+       END
+       WHERE (f.user_id = $1 OR f.friend_id = $1) AND f.status = 'accepted'
+       ORDER BY last_message_time DESC NULLS LAST`,
       [req.userId],
     )
 

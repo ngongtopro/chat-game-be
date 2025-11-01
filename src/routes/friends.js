@@ -60,7 +60,7 @@ router.post("/accept", authMiddleware, async (req, res) => {
 
     const result = await query(
       `UPDATE friendships 
-       SET status = 'accepted', updated_at = NOW() 
+       SET status = 'accepted'
        WHERE user_id = $1 AND friend_id = $2 AND status = 'pending'
        RETURNING *`,
       [friendId, req.userId],
