@@ -1,25 +1,9 @@
-const { Pool } = require("pg")
+// Import Drizzle database instance
+const { db, pool } = require('./db/index')
 
-// Create PostgreSQL connection pool
-const pool = new Pool({
-  host: process.env.DB_HOST || "100.64.192.68",
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME || "nonfar",
-  user: process.env.DB_USER || "myuser",
-  password: process.env.DB_PASSWORD || "mypassword",
-  max: 20,
-  idleTimeoutMillis: 30000,
-  connectionTimeoutMillis: 2000,
-})
-
-// Test connection
+// For backward compatibility, keep the pool connection events
 pool.on("connect", () => {
-  console.log("[v0] Connected to PostgreSQL database")
-})
-
-pool.on("error", (err) => {
-  console.error("[v0] Unexpected error on idle client", err)
-  process.exit(-1)
+  console.log("[v0] Connected to PostgreSQL database (legacy)")
 })
 
 // Query helper function
@@ -67,4 +51,5 @@ module.exports = {
   query,
   getClient,
   pool,
+  db, // Export Drizzle instance
 }

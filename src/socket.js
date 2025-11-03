@@ -1,5 +1,15 @@
 const { verifyToken } = require("./auth")
-const { query } = require("./db")
+const { db } = require("./db")
+const { eq, and, or, sql } = require("drizzle-orm")
+const { 
+  users, 
+  friendships, 
+  caroRooms, 
+  caroGames, 
+  wallets, 
+  transactions, 
+  caroStats 
+} = require("./db/schema")
 
 // Store online users: userId -> socketId
 const onlineUsers = new Map()
@@ -47,22 +57,30 @@ function setupSocketHandlers(io) {
 
     // Get user's friends and notify them
     try {
-      const friendsResult = await query(
-        `SELECT CASE 
-          WHEN user_id = $1 THEN friend_id 
-          ELSE user_id 
-        END as friend_id 
-        FROM friendships 
-        WHERE (user_id = $1 OR friend_id = $1) AND status = 'accepted'`,
-        [socket.userId]
-      )
+      const friendsList = await db
+        .select({
+          friendId: sql`CASE 
+            WHEN ${friendships.userId} = ${socket.userId} THEN ${friendships.friendId}
+            ELSE ${friendships.userId}
+          END`.as('friend_id')
+        })
+        .from(friendships)
+        .where(
+          and(
+            or(
+              eq(friendships.userId, socket.userId),
+              eq(friendships.friendId, socket.userId)
+            ),
+            eq(friendships.status, 'accepted')
+          )
+        )
       
       // Notify all friends that this user is online
-      friendsResult.rows.forEach(row => {
-        io.to(`user:${row.friend_id}`).emit("user-online", { userId: socket.userId })
+      friendsList.forEach(row => {
+        io.to(`user:${row.friendId}`).emit("user-online", { userId: socket.userId })
       })
 
-      console.log(`[Socket] User ${socket.userId} is now online, notified ${friendsResult.rows.length} friends`)
+      console.log(`[Socket] User ${socket.userId} is now online, notified ${friendsList.length} friends`)
     } catch (error) {
       console.error("[Socket] Error notifying friends:", error)
     }
@@ -115,24 +133,23 @@ function setupSocketHandlers(io) {
     socket.on("caro:leave-room", async (roomCode) => {
       try {
         // Get room and game info before leaving
-        const roomResult = await query(
-          `SELECT cr.*, cg.* 
-           FROM caro_rooms cr
-           JOIN caro_games cg ON cr.id = cg.room_id
-           WHERE cr.room_code = $1`,
-          [roomCode]
-        )
+        const roomData = await db
+          .select()
+          .from(caroRooms)
+          .innerJoin(caroGames, eq(caroRooms.id, caroGames.roomId))
+          .where(eq(caroRooms.roomCode, roomCode))
+          .limit(1)
 
-        if (roomResult.rows.length === 0) {
+        if (roomData.length === 0) {
           socket.leave(`caro:${roomCode}`)
           return console.error(`[Caro] Room ${roomCode} not found`)
         }
 
-        const game = roomResult.rows[0]
+        const game = { ...roomData[0].caro_rooms, ...roomData[0].caro_games }
         
         // Determine which player is leaving
-        const isPlayer1 = game.player1_id === socket.userId
-        const isPlayer2 = game.player2_id === socket.userId
+        const isPlayer1 = game.player1Id === socket.userId
+        const isPlayer2 = game.player2Id === socket.userId
 
         if (!isPlayer1 && !isPlayer2) {
           socket.leave(`caro:${roomCode}`)
@@ -141,62 +158,91 @@ function setupSocketHandlers(io) {
 
         // If game is in progress, handle as forfeit
         if (game.status === 'playing') {
-          const winnerId = isPlayer1 ? game.player2_id : game.player1_id
+          const winnerId = isPlayer1 ? game.player2Id : game.player1Id
           const loserId = socket.userId
           const winner = isPlayer1 ? 2 : 1
 
           // Update game as finished with forfeit
-          await query(
-            `UPDATE caro_games 
-             SET status = 'finished', winner_id = $1, finished_at = NOW()
-             WHERE id = $2`,
-            [winnerId, game.id]
-          )
+          await db
+            .update(caroGames)
+            .set({ 
+              status: 'finished', 
+              winnerId: winnerId, 
+              finishedAt: new Date() 
+            })
+            .where(eq(caroGames.id, game.id))
 
-          await query(
-            `UPDATE caro_rooms 
-             SET status = 'finished', finished_at = NOW()
-             WHERE room_code = $1`,
-            [roomCode]
-          )
+          await db
+            .update(caroRooms)
+            .set({ 
+              status: 'finished', 
+              finishedAt: new Date() 
+            })
+            .where(eq(caroRooms.roomCode, roomCode))
 
           // Calculate winnings (winner gets full pot)
-          const totalPot = game.bet_amount * 2
+          const totalPot = parseFloat(game.betAmount) * 2
           const winnings = totalPot * 0.8
 
           // Update wallets
-          await query("UPDATE wallets SET balance = balance + $1 WHERE user_id = $2", [winnings, winnerId])
+          await db
+            .update(wallets)
+            .set({ 
+              balance: sql`${wallets.balance} + ${winnings}` 
+            })
+            .where(eq(wallets.userId, winnerId))
           
           // Record transactions
-          await query(
-            "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
-            [winnerId, winnings, "game_win", "caro", `Won caro game in room ${roomCode} (opponent forfeited)`]
-          )
-          await query(
-            "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
-            [loserId, -game.bet_amount, "game_loss", "caro", `Lost caro game in room ${roomCode} (forfeited)`]
-          )
+          await db.insert(transactions).values({
+            userId: winnerId,
+            amount: winnings.toString(),
+            type: "game_win",
+            source: "caro",
+            description: `Won caro game in room ${roomCode} (opponent forfeited)`
+          })
+          
+          await db.insert(transactions).values({
+            userId: loserId,
+            amount: (-parseFloat(game.betAmount)).toString(),
+            type: "game_loss",
+            source: "caro",
+            description: `Lost caro game in room ${roomCode} (forfeited)`
+          })
 
-          // Update stats
-          await query(
-            `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
-             VALUES ($1, 1, 1, $2)
-             ON CONFLICT (user_id) 
-             DO UPDATE SET 
-               games_played = caro_stats.games_played + 1,
-               games_won = caro_stats.games_won + 1,
-               total_earnings = caro_stats.total_earnings + $2`,
-            [winnerId, winnings]
-          )
-          await query(
-            `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
-             VALUES ($1, 1, 0, $2)
-             ON CONFLICT (user_id) 
-             DO UPDATE SET 
-               games_played = caro_stats.games_played + 1,
-               total_earnings = caro_stats.total_earnings + $2`,
-            [loserId, -game.bet_amount]
-          )
+          // Update stats - insert or update for winner
+          await db
+            .insert(caroStats)
+            .values({
+              userId: winnerId,
+              gamesPlayed: 1,
+              gamesWon: 1,
+              totalEarnings: winnings.toString()
+            })
+            .onConflictDoUpdate({
+              target: caroStats.userId,
+              set: {
+                gamesPlayed: sql`${caroStats.gamesPlayed} + 1`,
+                gamesWon: sql`${caroStats.gamesWon} + 1`,
+                totalEarnings: sql`${caroStats.totalEarnings} + ${winnings}`
+              }
+            })
+          
+          // Update stats - insert or update for loser
+          await db
+            .insert(caroStats)
+            .values({
+              userId: loserId,
+              gamesPlayed: 1,
+              gamesWon: 0,
+              totalEarnings: (-parseFloat(game.betAmount)).toString()
+            })
+            .onConflictDoUpdate({
+              target: caroStats.userId,
+              set: {
+                gamesPlayed: sql`${caroStats.gamesPlayed} + 1`,
+                totalEarnings: sql`${caroStats.totalEarnings} + ${-parseFloat(game.betAmount)}`
+              }
+            })
 
           // Notify room of forfeit
           socket.to(`caro:${roomCode}`).emit("caro:player-left", {
@@ -211,12 +257,10 @@ function setupSocketHandlers(io) {
           // Game not started yet
           if (isPlayer1) {
             // Player 1 (host) is leaving - close the room
-            await query(
-              `UPDATE caro_rooms 
-               SET status = 'cancelled'
-               WHERE room_code = $1`,
-              [roomCode]
-            )
+            await db
+              .update(caroRooms)
+              .set({ status: 'cancelled' })
+              .where(eq(caroRooms.roomCode, roomCode))
 
             // Notify room that host left
             socket.to(`caro:${roomCode}`).emit("caro:room-closed", {
@@ -229,31 +273,35 @@ function setupSocketHandlers(io) {
             console.log(`[Caro] Host left room ${roomCode}, room closed`)
           } else if (isPlayer2) {
             // Player 2 is leaving - reset player2 and ready status
-            await query(
-              `UPDATE caro_games 
-               SET player2_id = NULL, player1_ready = FALSE, player2_ready = FALSE
-               WHERE id = $1`,
-              [game.id]
-            )
+            await db
+              .update(caroGames)
+              .set({ 
+                player2Id: null, 
+                player1Ready: false, 
+                player2Ready: false 
+              })
+              .where(eq(caroGames.id, game.id))
 
             // Get updated room info
-            const updatedRoom = await query(
-              `SELECT cr.*, cg.*,
-                      u1.username as player1_username
-               FROM caro_rooms cr
-               JOIN caro_games cg ON cr.id = cg.room_id
-               JOIN users u1 ON cg.player1_id = u1.id
-               WHERE cr.room_code = $1`,
-              [roomCode]
-            )
+            const updatedRoomData = await db
+              .select({
+                ...caroRooms,
+                ...caroGames,
+                player1Username: users.username
+              })
+              .from(caroRooms)
+              .innerJoin(caroGames, eq(caroRooms.id, caroGames.roomId))
+              .innerJoin(users, eq(caroGames.player1Id, users.id))
+              .where(eq(caroRooms.roomCode, roomCode))
+              .limit(1)
 
             console.log(`[Caro] Player 2 (${socket.userId}) left room ${roomCode}, notifying room`)
 
             // Notify room that player2 left (use io.to to include all sockets in room)
-            io.to(`caro:${roomCode}`).emit("caro:room-updated", updatedRoom.rows[0])
+            io.to(`caro:${roomCode}`).emit("caro:room-updated", updatedRoomData[0])
 
             // Notify lobby that room is available again
-            io.to("caro:lobby").emit("caro:room-available", updatedRoom.rows[0])
+            io.to("caro:lobby").emit("caro:room-available", updatedRoomData[0])
 
             console.log(`[Caro] Room ${roomCode} updated, room now available`)
           }
@@ -286,95 +334,101 @@ function setupSocketHandlers(io) {
       
       try {
         // Get room and game info
-        const roomResult = await query(
-          `SELECT cr.*, cg.* 
-           FROM caro_rooms cr
-           JOIN caro_games cg ON cr.id = cg.room_id
-           WHERE cr.room_code = $1`,
-          [roomCode]
-        )
+        const roomData = await db
+          .select()
+          .from(caroRooms)
+          .innerJoin(caroGames, eq(caroRooms.id, caroGames.roomId))
+          .where(eq(caroRooms.roomCode, roomCode))
+          .limit(1)
 
-        if (roomResult.rows.length === 0) {
+        if (roomData.length === 0) {
           return console.error(`[Caro] Room ${roomCode} not found`)
         }
 
-        const game = roomResult.rows[0]
+        const game = { ...roomData[0].caro_rooms, ...roomData[0].caro_games }
         
         // Determine which player is readying up
-        const isPlayer1 = game.player1_id === socket.userId
-        const isPlayer2 = game.player2_id === socket.userId
+        const isPlayer1 = game.player1Id === socket.userId
+        const isPlayer2 = game.player2Id === socket.userId
 
         if (!isPlayer1 && !isPlayer2) {
           return console.error(`[Caro] User ${socket.userId} is not in room ${roomCode}`)
         }
 
         // Update ready status
-        const readyField = isPlayer1 ? 'player1_ready' : 'player2_ready'
-        await query(
-          `UPDATE caro_games 
-           SET ${readyField} = TRUE
-           WHERE id = $1`,
-          [game.id]
-        )
+        if (isPlayer1) {
+          await db
+            .update(caroGames)
+            .set({ player1Ready: true })
+            .where(eq(caroGames.id, game.id))
+        } else {
+          await db
+            .update(caroGames)
+            .set({ player2Ready: true })
+            .where(eq(caroGames.id, game.id))
+        }
 
         // Get updated game info
-        const updatedGame = await query(
-          `SELECT cg.*, 
-                  u1.username as player1_username,
-                  u2.username as player2_username
-           FROM caro_games cg
-           JOIN users u1 ON cg.player1_id = u1.id
-           LEFT JOIN users u2 ON cg.player2_id = u2.id
-           WHERE cg.id = $1`,
-          [game.id]
-        )
+        const updatedGameData = await db
+          .select({
+            ...caroGames,
+            player1Username: sql`u1.username`.as('player1_username'),
+            player2Username: sql`u2.username`.as('player2_username')
+          })
+          .from(caroGames)
+          .innerJoin(sql`users u1`, eq(caroGames.player1Id, sql`u1.id`))
+          .leftJoin(sql`users u2`, eq(caroGames.player2Id, sql`u2.id`))
+          .where(eq(caroGames.id, game.id))
+          .limit(1)
 
-        const updated = updatedGame.rows[0]
+        const updated = updatedGameData[0]
 
         // Broadcast ready status to room
         io.to(`caro:${roomCode}`).emit("caro:player-ready", {
           playerId: socket.userId,
-          player1Ready: updated.player1_ready,
-          player2Ready: updated.player2_ready
+          player1Ready: updated.player1Ready,
+          player2Ready: updated.player2Ready
         })
 
         console.log(`[Caro] Player ${socket.userId} is ready in room ${roomCode}`)
 
         // If both players are ready, start the game
-        if (updated.player1_ready && updated.player2_ready && updated.status === 'waiting') {
-          await query(
-            `UPDATE caro_games 
-             SET status = 'playing'
-             WHERE id = $1`,
-            [game.id]
-          )
+        if (updated.player1Ready && updated.player2Ready && updated.status === 'waiting') {
+          await db
+            .update(caroGames)
+            .set({ status: 'playing' })
+            .where(eq(caroGames.id, game.id))
 
-          await query(
-            `UPDATE caro_rooms 
-             SET status = 'playing'
-             WHERE room_code = $1`,
-            [roomCode]
-          )
+          await db
+            .update(caroRooms)
+            .set({ status: 'playing' })
+            .where(eq(caroRooms.roomCode, roomCode))
 
-          // Get full room info
-          const fullRoom = await query(
-            `SELECT cr.*, cg.*,
-                    u1.username as player1_username,
-                    u2.username as player2_username,
-                    cs1.games_won as player1_wins, cs1.games_played as player1_games, cs1.level as player1_level,
-                    cs2.games_won as player2_wins, cs2.games_played as player2_games, cs2.level as player2_level
-             FROM caro_rooms cr
-             JOIN caro_games cg ON cr.id = cg.room_id
-             JOIN users u1 ON cg.player1_id = u1.id
-             LEFT JOIN users u2 ON cg.player2_id = u2.id
-             LEFT JOIN caro_stats cs1 ON cg.player1_id = cs1.user_id
-             LEFT JOIN caro_stats cs2 ON cg.player2_id = cs2.user_id
-             WHERE cr.room_code = $1`,
-            [roomCode]
-          )
+          // Get full room info with stats
+          const fullRoomData = await db
+            .select({
+              ...caroRooms,
+              ...caroGames,
+              player1Username: sql`u1.username`.as('player1_username'),
+              player2Username: sql`u2.username`.as('player2_username'),
+              player1Wins: sql`cs1.games_won`.as('player1_wins'),
+              player1Games: sql`cs1.games_played`.as('player1_games'),
+              player1Level: sql`cs1.level`.as('player1_level'),
+              player2Wins: sql`cs2.games_won`.as('player2_wins'),
+              player2Games: sql`cs2.games_played`.as('player2_games'),
+              player2Level: sql`cs2.level`.as('player2_level')
+            })
+            .from(caroRooms)
+            .innerJoin(caroGames, eq(caroRooms.id, caroGames.roomId))
+            .innerJoin(sql`users u1`, eq(caroGames.player1Id, sql`u1.id`))
+            .leftJoin(sql`users u2`, eq(caroGames.player2Id, sql`u2.id`))
+            .leftJoin(sql`caro_stats cs1`, eq(caroGames.player1Id, sql`cs1.user_id`))
+            .leftJoin(sql`caro_stats cs2`, eq(caroGames.player2Id, sql`cs2.user_id`))
+            .where(eq(caroRooms.roomCode, roomCode))
+            .limit(1)
 
           // Broadcast game start
-          io.to(`caro:${roomCode}`).emit("caro:game-started", fullRoom.rows[0])
+          io.to(`caro:${roomCode}`).emit("caro:game-started", fullRoomData[0])
           console.log(`[Caro] Game started in room ${roomCode}`)
         }
       } catch (error) {
@@ -396,22 +450,30 @@ function setupSocketHandlers(io) {
       // Get user's friends and notify them (only if removed from online users)
       if (!onlineUsers.has(socket.userId)) {
         try {
-          const friendsResult = await query(
-            `SELECT CASE 
-              WHEN user_id = $1 THEN friend_id 
-              ELSE user_id 
-            END as friend_id 
-            FROM friendships 
-            WHERE (user_id = $1 OR friend_id = $1) AND status = 'accepted'`,
-            [socket.userId]
-          )
+          const friendsList = await db
+            .select({
+              friendId: sql`CASE 
+                WHEN ${friendships.userId} = ${socket.userId} THEN ${friendships.friendId}
+                ELSE ${friendships.userId}
+              END`.as('friend_id')
+            })
+            .from(friendships)
+            .where(
+              and(
+                or(
+                  eq(friendships.userId, socket.userId),
+                  eq(friendships.friendId, socket.userId)
+                ),
+                eq(friendships.status, 'accepted')
+              )
+            )
           
           // Notify all friends that this user is offline
-          friendsResult.rows.forEach(row => {
-            io.to(`user:${row.friend_id}`).emit("user-offline", { userId: socket.userId })
+          friendsList.forEach(row => {
+            io.to(`user:${row.friendId}`).emit("user-offline", { userId: socket.userId })
           })
 
-          console.log(`[Socket] User ${socket.userId} is now offline, notified ${friendsResult.rows.length} friends`)
+          console.log(`[Socket] User ${socket.userId} is now offline, notified ${friendsList.length} friends`)
         } catch (error) {
           console.error("[Socket] Error notifying friends on disconnect:", error)
         }
