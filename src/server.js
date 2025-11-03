@@ -14,6 +14,7 @@ const walletRoutes = require("./routes/wallet")
 const farmRoutes = require("./routes/farm")
 const caroRoutes = require("./routes/caro")
 const chatRoutes = require("./routes/chat")
+const adminRoutes = require("./routes/admin")
 
 const app = express()
 const server = http.createServer(app)
@@ -46,6 +47,7 @@ app.use("/api/wallet", walletRoutes)
 app.use("/api/farm", farmRoutes)
 app.use("/api/caro", caroRoutes)
 app.use("/api/chat", chatRoutes)
+app.use("/api/admin", adminRoutes)
 
 // Health check
 app.get("/health", (req, res) => {

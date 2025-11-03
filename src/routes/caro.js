@@ -4,8 +4,14 @@ const { authMiddleware } = require("../auth")
 
 const router = express.Router()
 
-// Create game room
+// Create game room (ADMIN ONLY - Disabled for regular users)
 router.post("/create-room", authMiddleware, async (req, res) => {
+  // Block room creation for regular users
+  return res.status(403).json({ 
+    error: "Room creation is disabled. Only admin can create rooms." 
+  })
+  
+  /* DISABLED CODE - Keep for reference
   const client = await getClient()
   
   try {
@@ -56,6 +62,7 @@ router.post("/create-room", authMiddleware, async (req, res) => {
   } finally {
     client.release()
   }
+  */
 })
 
 // Join game room

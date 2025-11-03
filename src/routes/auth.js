@@ -22,7 +22,7 @@ router.post("/register", async (req, res) => {
 
     // Create user
     const result = await query(
-      "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, created_at",
+      "INSERT INTO users (username, email, password_hash) VALUES ($1, $2, $3) RETURNING id, username, email, type, created_at",
       [username, email, hashedPassword],
     )
 
@@ -96,7 +96,7 @@ router.post("/logout", (req, res) => {
 // Get current user
 router.get("/me", authMiddleware, async (req, res) => {
   try {
-    const result = await query("SELECT id, username, email, avatar_url, created_at FROM users WHERE id = $1", [
+    const result = await query("SELECT id, username, email, type, avatar_url, created_at FROM users WHERE id = $1", [
       req.userId,
     ])
 
