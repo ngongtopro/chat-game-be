@@ -137,6 +137,8 @@ router.post("/join-room", authMiddleware, async (req, res) => {
     const io = req.app.get("io")
     io.to("caro:lobby").emit("caro:room-full", { roomCode })
     
+    console.log(`[Caro] Room ${roomCode} updated: player 2 (${req.userId}) joined`)
+    
     // Notify players in the room that both players have joined
     io.to(`caro:${roomCode}`).emit("caro:room-updated", fullRoom.rows[0])
 

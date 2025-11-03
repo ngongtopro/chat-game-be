@@ -112,9 +112,159 @@ function setupSocketHandlers(io) {
       console.log(`[Caro] User ${socket.userId} joined room ${roomCode}`)
     })
 
-    socket.on("caro:leave-room", (roomCode) => {
-      socket.leave(`caro:${roomCode}`)
-      console.log(`[Caro] User ${socket.userId} left room ${roomCode}`)
+    socket.on("caro:leave-room", async (roomCode) => {
+      try {
+        // Get room and game info before leaving
+        const roomResult = await query(
+          `SELECT cr.*, cg.* 
+           FROM caro_rooms cr
+           JOIN caro_games cg ON cr.id = cg.room_id
+           WHERE cr.room_code = $1`,
+          [roomCode]
+        )
+
+        if (roomResult.rows.length === 0) {
+          socket.leave(`caro:${roomCode}`)
+          return console.error(`[Caro] Room ${roomCode} not found`)
+        }
+
+        const game = roomResult.rows[0]
+        
+        // Determine which player is leaving
+        const isPlayer1 = game.player1_id === socket.userId
+        const isPlayer2 = game.player2_id === socket.userId
+
+        if (!isPlayer1 && !isPlayer2) {
+          socket.leave(`caro:${roomCode}`)
+          return console.log(`[Caro] User ${socket.userId} left room ${roomCode} (was spectator)`)
+        }
+
+        // If game is in progress, handle as forfeit
+        if (game.status === 'playing') {
+          const winnerId = isPlayer1 ? game.player2_id : game.player1_id
+          const loserId = socket.userId
+          const winner = isPlayer1 ? 2 : 1
+
+          // Update game as finished with forfeit
+          await query(
+            `UPDATE caro_games 
+             SET status = 'finished', winner_id = $1, finished_at = NOW()
+             WHERE id = $2`,
+            [winnerId, game.id]
+          )
+
+          await query(
+            `UPDATE caro_rooms 
+             SET status = 'finished', finished_at = NOW()
+             WHERE room_code = $1`,
+            [roomCode]
+          )
+
+          // Calculate winnings (winner gets full pot)
+          const totalPot = game.bet_amount * 2
+          const winnings = totalPot * 0.8
+
+          // Update wallets
+          await query("UPDATE wallets SET balance = balance + $1 WHERE user_id = $2", [winnings, winnerId])
+          
+          // Record transactions
+          await query(
+            "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
+            [winnerId, winnings, "game_win", "caro", `Won caro game in room ${roomCode} (opponent forfeited)`]
+          )
+          await query(
+            "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
+            [loserId, -game.bet_amount, "game_loss", "caro", `Lost caro game in room ${roomCode} (forfeited)`]
+          )
+
+          // Update stats
+          await query(
+            `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
+             VALUES ($1, 1, 1, $2)
+             ON CONFLICT (user_id) 
+             DO UPDATE SET 
+               games_played = caro_stats.games_played + 1,
+               games_won = caro_stats.games_won + 1,
+               total_earnings = caro_stats.total_earnings + $2`,
+            [winnerId, winnings]
+          )
+          await query(
+            `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
+             VALUES ($1, 1, 0, $2)
+             ON CONFLICT (user_id) 
+             DO UPDATE SET 
+               games_played = caro_stats.games_played + 1,
+               total_earnings = caro_stats.total_earnings + $2`,
+            [loserId, -game.bet_amount]
+          )
+
+          // Notify room of forfeit
+          socket.to(`caro:${roomCode}`).emit("caro:player-left", {
+            playerId: socket.userId,
+            winner: winner,
+            winnings: winnings,
+            reason: 'forfeit'
+          })
+
+          console.log(`[Caro] Player ${socket.userId} forfeited game in room ${roomCode}`)
+        } else {
+          // Game not started yet
+          if (isPlayer1) {
+            // Player 1 (host) is leaving - close the room
+            await query(
+              `UPDATE caro_rooms 
+               SET status = 'cancelled'
+               WHERE room_code = $1`,
+              [roomCode]
+            )
+
+            // Notify room that host left
+            socket.to(`caro:${roomCode}`).emit("caro:room-closed", {
+              reason: 'host_left'
+            })
+
+            // Notify lobby to remove room
+            io.to("caro:lobby").emit("caro:room-removed", { roomCode })
+
+            console.log(`[Caro] Host left room ${roomCode}, room closed`)
+          } else if (isPlayer2) {
+            // Player 2 is leaving - reset player2 and ready status
+            await query(
+              `UPDATE caro_games 
+               SET player2_id = NULL, player1_ready = FALSE, player2_ready = FALSE
+               WHERE id = $1`,
+              [game.id]
+            )
+
+            // Get updated room info
+            const updatedRoom = await query(
+              `SELECT cr.*, cg.*,
+                      u1.username as player1_username
+               FROM caro_rooms cr
+               JOIN caro_games cg ON cr.id = cg.room_id
+               JOIN users u1 ON cg.player1_id = u1.id
+               WHERE cr.room_code = $1`,
+              [roomCode]
+            )
+
+            console.log(`[Caro] Player 2 (${socket.userId}) left room ${roomCode}, notifying room`)
+
+            // Notify room that player2 left (use io.to to include all sockets in room)
+            io.to(`caro:${roomCode}`).emit("caro:room-updated", updatedRoom.rows[0])
+
+            // Notify lobby that room is available again
+            io.to("caro:lobby").emit("caro:room-available", updatedRoom.rows[0])
+
+            console.log(`[Caro] Room ${roomCode} updated, room now available`)
+          }
+        }
+
+        socket.leave(`caro:${roomCode}`)
+        console.log(`[Caro] User ${socket.userId} left room ${roomCode}`)
+      } catch (error) {
+        console.error(`[Caro] Error handling leave room:`, error)
+        socket.leave(`caro:${roomCode}`)
+      }
     })
 
     socket.on("caro:move", (data) => {
