@@ -125,9 +125,57 @@ function setupSocketHandlers(io) {
       console.log(`[Caro] User ${socket.userId} left lobby`)
     })
 
-    socket.on("caro:join-room", (roomCode) => {
+    socket.on("caro:join-room", async (roomCode) => {
       socket.join(`caro:${roomCode}`)
       console.log(`[Caro] User ${socket.userId} joined room ${roomCode}`)
+      
+      // Get room info and update player count
+      try {
+        const roomData = await db
+          .select({
+            gameId: caroGames.id,
+            player1Id: caroGames.player1Id,
+            player2Id: caroGames.player2Id,
+            currentPlayerCount: caroGames.currentPlayerCount
+          })
+          .from(caroRooms)
+          .innerJoin(caroGames, eq(caroRooms.id, caroGames.roomId))
+          .where(eq(caroRooms.roomCode, roomCode))
+          .limit(1)
+
+        if (roomData.length > 0) {
+          const game = roomData[0]
+          
+          // Get all users in this room
+          const socketsInRoom = await io.in(`caro:${roomCode}`).fetchSockets()
+          const userIdsInRoom = [...new Set(socketsInRoom.map(s => s.userId))]
+          
+          // Count actual players (not spectators)
+          let actualPlayerCount = 0
+          if (game.player1Id && userIdsInRoom.includes(game.player1Id)) actualPlayerCount++
+          if (game.player2Id && userIdsInRoom.includes(game.player2Id)) actualPlayerCount++
+          
+          // Update player count
+          await db
+            .update(caroGames)
+            .set({ currentPlayerCount: actualPlayerCount })
+            .where(eq(caroGames.id, game.gameId))
+          
+          // Emit current online users to the joining user
+          socket.emit("caro:room-users-online", { userIds: userIdsInRoom })
+          
+          // Notify others in room that this user is online
+          socket.to(`caro:${roomCode}`).emit("caro:user-online", { userId: socket.userId })
+          
+          // Broadcast updated player count to lobby
+          io.to("caro:lobby").emit("caro:room-player-count", { 
+            roomCode, 
+            playerCount: actualPlayerCount 
+          })
+        }
+      } catch (error) {
+        console.error(`[Caro] Error updating player count:`, error)
+      }
     })
 
     socket.on("caro:leave-room", async (roomCode) => {
@@ -156,8 +204,17 @@ function setupSocketHandlers(io) {
           return console.log(`[Caro] User ${socket.userId} left room ${roomCode} (was spectator)`)
         }
 
-        // If game is in progress, handle as forfeit
-        if (game.status === 'playing') {
+        // Update player count
+        const newPlayerCount = Math.max(0, (game.currentPlayerCount || 0) - 1)
+        await db
+          .update(caroGames)
+          .set({ currentPlayerCount: newPlayerCount })
+          .where(eq(caroGames.id, game.id))
+
+        // If game is in progress, handle as forfeit (unless has time limit)
+        const hasTimeLimit = game.timeLimitMinutes !== null
+        if (game.status === 'playing' && !hasTimeLimit) {
+          // No time limit - immediate forfeit
           const winnerId = isPlayer1 ? game.player2Id : game.player1Id
           const loserId = socket.userId
           const winner = isPlayer1 ? 2 : 1
@@ -251,11 +308,49 @@ function setupSocketHandlers(io) {
             winnings: winnings,
             reason: 'forfeit'
           })
+          
+          // Notify room that user went offline
+          socket.to(`caro:${roomCode}`).emit("caro:user-offline", { userId: socket.userId })
 
           console.log(`[Caro] Player ${socket.userId} forfeited game in room ${roomCode}`)
+        } else if (game.status === 'playing' && hasTimeLimit) {
+          // Has time limit - player can rejoin
+          console.log(`[Caro] Player ${socket.userId} disconnected from room ${roomCode} (can rejoin)`)
+          
+          // Notify room that user went offline
+          socket.to(`caro:${roomCode}`).emit("caro:user-offline", { userId: socket.userId })
+          
+          // Notify lobby about player count change
+          io.to("caro:lobby").emit("caro:room-player-count", { 
+            roomCode, 
+            playerCount: newPlayerCount 
+          })
         } else {
           // Game not started yet
-          if (isPlayer1) {
+          if (newPlayerCount === 0) {
+            // No players left - reset room to defaults
+            await db
+              .update(caroGames)
+              .set({ 
+                player1Id: null,
+                player2Id: null, 
+                player1Ready: false, 
+                player2Ready: false,
+                currentPlayer: 1,
+                currentPlayerCount: 0
+              })
+              .where(eq(caroGames.id, game.id))
+
+            await db
+              .update(caroRooms)
+              .set({ status: 'cancelled' })
+              .where(eq(caroRooms.roomCode, roomCode))
+
+            // Notify lobby to remove room
+            io.to("caro:lobby").emit("caro:room-removed", { roomCode })
+
+            console.log(`[Caro] All players left room ${roomCode}, room reset and cancelled`)
+          } else if (isPlayer1) {
             // Player 1 (host) is leaving - close the room
             await db
               .update(caroRooms)
@@ -266,6 +361,9 @@ function setupSocketHandlers(io) {
             socket.to(`caro:${roomCode}`).emit("caro:room-closed", {
               reason: 'host_left'
             })
+            
+            // Notify room that user went offline
+            socket.to(`caro:${roomCode}`).emit("caro:user-offline", { userId: socket.userId })
 
             // Notify lobby to remove room
             io.to("caro:lobby").emit("caro:room-removed", { roomCode })
@@ -278,7 +376,8 @@ function setupSocketHandlers(io) {
               .set({ 
                 player2Id: null, 
                 player1Ready: false, 
-                player2Ready: false 
+                player2Ready: false,
+                currentPlayerCount: newPlayerCount
               })
               .where(eq(caroGames.id, game.id))
 
@@ -299,9 +398,18 @@ function setupSocketHandlers(io) {
 
             // Notify room that player2 left (use io.to to include all sockets in room)
             io.to(`caro:${roomCode}`).emit("caro:room-updated", updatedRoomData[0])
+            
+            // Notify room that user went offline
+            socket.to(`caro:${roomCode}`).emit("caro:user-offline", { userId: socket.userId })
 
             // Notify lobby that room is available again
             io.to("caro:lobby").emit("caro:room-available", updatedRoomData[0])
+            
+            // Notify lobby about player count change
+            io.to("caro:lobby").emit("caro:room-player-count", { 
+              roomCode, 
+              playerCount: newPlayerCount 
+            })
 
             console.log(`[Caro] Room ${roomCode} updated, room now available`)
           }
@@ -394,9 +502,18 @@ function setupSocketHandlers(io) {
 
         // If both players are ready, start the game
         if (updated.player1Ready && updated.player2Ready && updated.status === 'waiting') {
+          // Initialize time controls if time limit is set
+          const updateData = { status: 'playing' }
+          if (updated.timeLimitMinutes) {
+            const timeInSeconds = updated.timeLimitMinutes * 60
+            updateData.player1TimeLeft = timeInSeconds
+            updateData.player2TimeLeft = timeInSeconds
+            updateData.lastMoveTime = new Date()
+          }
+
           await db
             .update(caroGames)
-            .set({ status: 'playing' })
+            .set(updateData)
             .where(eq(caroGames.id, game.id))
 
           await db
@@ -474,6 +591,12 @@ function setupSocketHandlers(io) {
           })
 
           console.log(`[Socket] User ${socket.userId} is now offline, notified ${friendsList.length} friends`)
+          
+          // Notify all caro rooms that this user went offline
+          const rooms = Array.from(socket.rooms).filter(room => room.startsWith('caro:') && room !== 'caro:lobby')
+          rooms.forEach(room => {
+            io.to(room).emit("caro:user-offline", { userId: socket.userId })
+          })
         } catch (error) {
           console.error("[Socket] Error notifying friends on disconnect:", error)
         }

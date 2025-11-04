@@ -123,13 +123,19 @@ router.get("/users/:userId", async (req, res) => {
 router.patch("/users/:userId", async (req, res) => {
   try {
     const { userId } = req.params
-    const { type, balanceChange } = req.body
+    const { type, balanceChange, username, email } = req.body
 
-    // Update user type if provided
-    if (type && ['admin', 'regular'].includes(type)) {
+    // Update user basic info if provided
+    const userUpdates = {}
+    if (username) userUpdates.username = username
+    if (email) userUpdates.email = email
+    if (type && ['admin', 'regular'].includes(type)) userUpdates.type = type
+    
+    if (Object.keys(userUpdates).length > 0) {
+      userUpdates.updatedAt = new Date()
       await db
         .update(users)
-        .set({ type, updatedAt: new Date() })
+        .set(userUpdates)
         .where(eq(users.id, parseInt(userId)))
     }
 
@@ -217,10 +223,8 @@ router.get("/caro/rooms", async (req, res) => {
 router.post("/caro/rooms", async (req, res) => {
   try {
     const { betAmount = 10 } = req.body
-
     // Generate unique room code
-    const roomCode = `ADMIN-${Date.now().toString(36).toUpperCase()}`
-
+    const roomCode = `${Date.now().toString(36).toUpperCase()}`
     // Create room
     const [room] = await db
       .insert(caroRooms)
@@ -230,24 +234,10 @@ router.post("/caro/rooms", async (req, res) => {
       })
       .returning()
 
-    // Create game with admin as player1
-    const [game] = await db
-      .insert(caroGames)
-      .values({
-        roomId: room.id,
-        player1Id: req.userId,
-        betAmount: betAmount.toString(),
-        boardState: {},
-        currentTurn: 1,
-        status: 'waiting'
-      })
-      .returning()
-
     res.json({
       message: "Room created successfully",
       room: {
         ...room,
-        betAmount: game.betAmount
       }
     })
   } catch (error) {
@@ -260,7 +250,7 @@ router.post("/caro/rooms", async (req, res) => {
 router.delete("/caro/rooms/:roomCode", async (req, res) => {
   try {
     const { roomCode } = req.params
-
+    console.log('roomCode', roomCode)
     await db
       .update(caroRooms)
       .set({ 
@@ -273,6 +263,41 @@ router.delete("/caro/rooms/:roomCode", async (req, res) => {
   } catch (error) {
     console.error("[Admin] Close caro room error:", error)
     res.status(500).json({ error: "Failed to close caro room" })
+  }
+})
+
+// Update caro room
+router.patch("/caro/rooms/:roomCode", async (req, res) => {
+  try {
+    const { roomCode } = req.params
+    const { betAmount } = req.body
+
+    // Find room and game
+    const [room] = await db
+      .select()
+      .from(caroRooms)
+      .where(eq(caroRooms.roomCode, roomCode))
+      .limit(1)
+
+    if (!room) {
+      return res.status(404).json({ error: "Room not found" })
+    }
+
+    // Update bet amount if provided
+    if (betAmount && !isNaN(parseFloat(betAmount))) {
+      await db
+        .update(caroGames)
+        .set({
+          betAmount: betAmount.toString(),
+          updatedAt: new Date()
+        })
+        .where(eq(caroGames.roomId, room.id))
+    }
+
+    res.json({ message: "Room updated successfully" })
+  } catch (error) {
+    console.error("[Admin] Update caro room error:", error)
+    res.status(500).json({ error: "Failed to update caro room" })
   }
 })
 

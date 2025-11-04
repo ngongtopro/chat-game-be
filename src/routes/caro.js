@@ -1,384 +1,515 @@
 const express = require("express")
-const { query, getClient } = require("../db")
+const { db } = require("../db/helpers")
 const { authMiddleware } = require("../auth")
+const { eq, and, or, sql, desc, isNull } = require("drizzle-orm")
+const schema = require("../db/schema")
 
 const router = express.Router()
 
-// Create game room (ADMIN ONLY - Disabled for regular users)
-router.post("/create-room", authMiddleware, async (req, res) => {
-  // Block room creation for regular users
-  return res.status(403).json({ 
-    error: "Room creation is disabled. Only admin can create rooms." 
-  })
-  
-  /* DISABLED CODE - Keep for reference
-  const client = await getClient()
-  
-  try {
-    const { betAmount } = req.body
-
-    // Generate room code
-    const roomCode = Math.random().toString(36).substring(2, 8).toUpperCase()
-
-    await client.query("BEGIN")
-
-    // Create room
-    const roomResult = await client.query(
-      `INSERT INTO caro_rooms (room_code, status) 
-       VALUES ($1, 'waiting') 
-       RETURNING *`,
-      [roomCode],
-    )
-
-    // Create game in the room
-    const gameResult = await client.query(
-      `INSERT INTO caro_games (room_id, player1_id, bet_amount, status, board_size, win_condition, current_player) 
-       VALUES ($1, $2, $3, 'waiting', 15, 5, 1) 
-       RETURNING *`,
-      [roomResult.rows[0].id, req.userId, betAmount],
-    )
-
-    await client.query("COMMIT")
-
-    // Get room with player info for broadcast
-    const fullRoom = await query(
-      `SELECT cr.room_code, cg.bet_amount, u.username as player1_username, cg.id as game_id
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       JOIN users u ON cg.player1_id = u.id
-       WHERE cr.room_code = $1`,
-      [roomCode]
-    )
-
-    // Broadcast new room to lobby
-    const io = req.app.get("io")
-    io.to("caro:lobby").emit("caro:room-created", fullRoom.rows[0])
-
-    res.json({ room: roomResult.rows[0], game: gameResult.rows[0] })
-  } catch (error) {
-    await client.query("ROLLBACK")
-    console.error("[v0] Create room error:", error)
-    res.status(500).json({ error: "Failed to create room" })
-  } finally {
-    client.release()
-  }
-  */
-})
-
 // Join game room
 router.post("/join-room", authMiddleware, async (req, res) => {
-  const client = await getClient()
-
   try {
     const { roomCode } = req.body
+    console.log(`[Caro] User ${req.userId} joining room ${roomCode}`)
+    
+    const result = await db.transaction(async (tx) => {
+      // Get room and game info with explicit column selection
+      const roomResult = await tx
+        .select({
+          roomId: sql`${schema.caroRooms.id}`.as('room_id'),
+          roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+          roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+          gameId: sql`${schema.caroGames.id}`.as('game_id'),
+          player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+          player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+          player1Ready: sql`${schema.caroGames.player1Ready}`.as('player1_ready'),
+          player2Ready: sql`${schema.caroGames.player2Ready}`.as('player2_ready'),
+          betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+          currentPlayer: sql`${schema.caroGames.currentPlayer}`.as('current_player'),
+          gameStatus: sql`${schema.caroGames.status}`.as('game_status'),
+          currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+          timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
+          player1TimeLeft: sql`${schema.caroGames.player1TimeLeft}`.as('player1_time_left'),
+          player2TimeLeft: sql`${schema.caroGames.player2TimeLeft}`.as('player2_time_left')
+        })
+        .from(schema.caroRooms)
+        .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+        .where(
+          and(
+            eq(schema.caroRooms.roomCode, roomCode),
+            eq(schema.caroRooms.status, "waiting")
+          )
+        )
+        .limit(1)
 
-    await client.query("BEGIN")
+      if (roomResult.length === 0) {
+        throw new Error("Room not found or already started")
+      }
 
-    // Get room and game info
-    const roomResult = await client.query(
-      `SELECT cr.*, cg.* 
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       WHERE cr.room_code = $1 AND cr.status = 'waiting'`,
-      [roomCode],
-    )
+      const game = roomResult[0]
 
-    if (roomResult.rows.length === 0) {
-      await client.query("ROLLBACK")
-      return res.status(404).json({ error: "Room not found or already full" })
-    }
+      // Check if room is full (2 players)
+      if (game.player2Id && game.player2Id !== req.userId && game.player1Id !== req.userId) {
+        throw new Error("Room is full")
+      }
 
-    const game = roomResult.rows[0]
+      // If player1 tries to join their own room, just return room info
+      if (game.player1Id === req.userId) {
+        // Increment player count if not already counted
+        if (game.currentPlayerCount === 0) {
+          await tx
+            .update(schema.caroGames)
+            .set({ currentPlayerCount: 1 })
+            .where(eq(schema.caroGames.id, game.gameId))
+        }
 
-    // If player1 tries to join their own room, just return room info
-    if (game.player1_id === req.userId) {
-      await client.query("ROLLBACK")
-      
-      // Get full room info
-      const fullRoom = await query(
-        `SELECT cr.*, cg.*,
-                u1.username as player1_username,
-                u2.username as player2_username
-         FROM caro_rooms cr
-         JOIN caro_games cg ON cr.id = cg.room_id
-         JOIN users u1 ON cg.player1_id = u1.id
-         LEFT JOIN users u2 ON cg.player2_id = u2.id
-         WHERE cr.room_code = $1`,
-        [roomCode]
-      )
-      
-      return res.json({ room: fullRoom.rows[0] })
-    }
+        // Get full room info
+        const fullRoom = await getRoomDetails(tx, roomCode)
+        return fullRoom
+      }
 
-    // Update game with player2
-    await client.query(
-      `UPDATE caro_games 
-       SET player2_id = $1
-       WHERE id = $2`,
-      [req.userId, game.id],
-    )
+      // Update game with player2 and increment player count
+      await tx
+        .update(schema.caroGames)
+        .set({ 
+          player2Id: req.userId,
+          currentPlayerCount: 2
+        })
+        .where(eq(schema.caroGames.id, game.gameId))
 
-    // Keep room status as waiting until both players are ready
-    // The socket handler will change it to 'playing' when both are ready
+      // Get full room info with players and stats
+      const fullRoom = await getRoomDetails(tx, roomCode)
+      return fullRoom
+    })
 
-    await client.query("COMMIT")
-
-    // Get full room info with players
-    const fullRoom = await query(
-      `SELECT cr.*, cg.*,
-              u1.username as player1_username,
-              u2.username as player2_username,
-              cs1.games_won as player1_wins, cs1.games_played as player1_games, cs1.level as player1_level,
-              cs2.games_won as player2_wins, cs2.games_played as player2_games, cs2.level as player2_level
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       JOIN users u1 ON cg.player1_id = u1.id
-       LEFT JOIN users u2 ON cg.player2_id = u2.id
-       LEFT JOIN caro_stats cs1 ON cg.player1_id = cs1.user_id
-       LEFT JOIN caro_stats cs2 ON cg.player2_id = cs2.user_id
-       WHERE cr.room_code = $1`,
-      [roomCode]
-    )
-
-    // Broadcast room update to lobby (room is now full but not started yet)
+    // Broadcast room update to lobby
     const io = req.app.get("io")
-    io.to("caro:lobby").emit("caro:room-full", { roomCode })
+    io.to("caro:lobby").emit("caro:room-updated", result)
     
     console.log(`[Caro] Room ${roomCode} updated: player 2 (${req.userId}) joined`)
     
     // Notify players in the room that both players have joined
-    io.to(`caro:${roomCode}`).emit("caro:room-updated", fullRoom.rows[0])
+    io.to(`caro:${roomCode}`).emit("caro:room-updated", result)
 
-    res.json({ room: fullRoom.rows[0] })
+    res.json({ room: result })
   } catch (error) {
-    await client.query("ROLLBACK")
-    console.error("[v0] Join room error:", error)
-    res.status(500).json({ error: "Failed to join room" })
-  } finally {
-    client.release()
+    console.error("[Caro] Join room error:", error)
+    const statusCode = error.message === "Room not found or already started" ? 404 :
+                       error.message === "Room is full" ? 400 : 500
+    res.status(statusCode).json({ 
+      error: error.message || "Failed to join room" 
+    })
   }
 })
+
+// Helper function to get room details
+async function getRoomDetails(tx, roomCode) {
+  const fullRoom = await tx
+    .select({
+      id: sql`${schema.caroRooms.id}`.as('id'),
+      roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+      status: sql`${schema.caroRooms.status}`.as('status'),
+      createdAt: sql`${schema.caroRooms.createdAt}`.as('created_at'),
+      finishedAt: sql`${schema.caroRooms.finishedAt}`.as('finished_at'),
+      gameId: sql`${schema.caroGames.id}`.as('game_id'),
+      player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+      player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+      player1Ready: sql`${schema.caroGames.player1Ready}`.as('player1_ready'),
+      player2Ready: sql`${schema.caroGames.player2Ready}`.as('player2_ready'),
+      winnerId: sql`${schema.caroGames.winnerId}`.as('winner_id'),
+      betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+      boardState: sql`${schema.caroGames.boardState}`.as('board_state'),
+      currentPlayer: sql`${schema.caroGames.currentPlayer}`.as('current_player'),
+      gameStatus: sql`${schema.caroGames.status}`.as('game_status'),
+      currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+      timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
+      player1TimeLeft: sql`${schema.caroGames.player1TimeLeft}`.as('player1_time_left'),
+      player2TimeLeft: sql`${schema.caroGames.player2TimeLeft}`.as('player2_time_left'),
+      lastMoveTime: sql`${schema.caroGames.lastMoveTime}`.as('last_move_time'),
+      winCondition: sql`5`.as('win_condition'),
+      player1Username: sql`u1.username`.as('player1_username'),
+      player2Username: sql`u2.username`.as('player2_username'),
+      player1Games: sql`COALESCE(cs1.games_played, 0)`.as('player1_games'),
+      player1Wins: sql`COALESCE(cs1.games_won, 0)`.as('player1_wins'),
+      player1Level: sql`COALESCE(cs1.level, 1)`.as('player1_level'),
+      player2Games: sql`COALESCE(cs2.games_played, 0)`.as('player2_games'),
+      player2Wins: sql`COALESCE(cs2.games_won, 0)`.as('player2_wins'),
+      player2Level: sql`COALESCE(cs2.level, 1)`.as('player2_level')
+    })
+    .from(schema.caroRooms)
+    .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+    .innerJoin(sql`users u1`, eq(schema.caroGames.player1Id, sql`u1.id`))
+    .leftJoin(sql`users u2`, eq(schema.caroGames.player2Id, sql`u2.id`))
+    .leftJoin(sql`caro_stats cs1`, eq(schema.caroGames.player1Id, sql`cs1.user_id`))
+    .leftJoin(sql`caro_stats cs2`, eq(schema.caroGames.player2Id, sql`cs2.user_id`))
+    .where(eq(schema.caroRooms.roomCode, roomCode))
+    .limit(1)
+
+  return fullRoom[0]
+}
 
 // Get room info
 router.get("/room/:roomCode", authMiddleware, async (req, res) => {
   try {
     const { roomCode } = req.params
 
-    const result = await query(
-      `SELECT cr.room_code, cr.status as room_status, cr.created_at, cr.finished_at,
-              cg.id as game_id, cg.player1_id, cg.player2_id, cg.current_player, 
-              cg.status as game_status, cg.winner_id, cg.bet_amount, cg.board_size, cg.win_condition,
-              cg.player1_ready, cg.player2_ready,
-              u1.username as player1_username, u1.avatar_url as player1_avatar,
-              u2.username as player2_username, u2.avatar_url as player2_avatar,
-              cs1.games_won as player1_wins, cs1.games_played as player1_games, cs1.level as player1_level,
-              cs2.games_won as player2_wins, cs2.games_played as player2_games, cs2.level as player2_level
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       JOIN users u1 ON cg.player1_id = u1.id
-       LEFT JOIN users u2 ON cg.player2_id = u2.id
-       LEFT JOIN caro_stats cs1 ON cg.player1_id = cs1.user_id
-       LEFT JOIN caro_stats cs2 ON cg.player2_id = cs2.user_id
-       WHERE cr.room_code = $1`,
-      [roomCode],
-    )
+    // Get room with full details
+    const roomResult = await db
+      .select({
+        roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+        roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+        createdAt: sql`${schema.caroRooms.createdAt}`.as('created_at'),
+        finishedAt: sql`${schema.caroRooms.finishedAt}`.as('finished_at'),
+        gameId: sql`${schema.caroGames.id}`.as('game_id'),
+        player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+        player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+        currentPlayer: sql`${schema.caroGames.currentPlayer}`.as('current_player'),
+        gameStatus: sql`${schema.caroGames.status}`.as('game_status'),
+        winnerId: sql`${schema.caroGames.winnerId}`.as('winner_id'),
+        betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+        currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+        timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
+        player1TimeLeft: sql`${schema.caroGames.player1TimeLeft}`.as('player1_time_left'),
+        player2TimeLeft: sql`${schema.caroGames.player2TimeLeft}`.as('player2_time_left'),
+        lastMoveTime: sql`${schema.caroGames.lastMoveTime}`.as('last_move_time'),
+        winCondition: sql`5`.as('win_condition'),
+        player1Ready: sql`${schema.caroGames.player1Ready}`.as('player1_ready'),
+        player2Ready: sql`${schema.caroGames.player2Ready}`.as('player2_ready'),
+        player1Username: sql`u1.username`.as('player1_username'),
+        player1Avatar: sql`u1.avatar_url`.as('player1_avatar'),
+        player2Username: sql`u2.username`.as('player2_username'),
+        player2Avatar: sql`u2.avatar_url`.as('player2_avatar'),
+        player1Games: sql`COALESCE(cs1.games_played, 0)`.as('player1_games'),
+        player1Wins: sql`COALESCE(cs1.games_won, 0)`.as('player1_wins'),
+        player1Level: sql`COALESCE(cs1.level, 1)`.as('player1_level'),
+        player2Games: sql`COALESCE(cs2.games_played, 0)`.as('player2_games'),
+        player2Wins: sql`COALESCE(cs2.games_won, 0)`.as('player2_wins'),
+        player2Level: sql`COALESCE(cs2.level, 1)`.as('player2_level')
+      })
+      .from(schema.caroRooms)
+      .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+      .innerJoin(sql`users u1`, eq(schema.caroGames.player1Id, sql`u1.id`))
+      .leftJoin(sql`users u2`, eq(schema.caroGames.player2Id, sql`u2.id`))
+      .leftJoin(sql`caro_stats cs1`, eq(schema.caroGames.player1Id, sql`cs1.user_id`))
+      .leftJoin(sql`caro_stats cs2`, eq(schema.caroGames.player2Id, sql`cs2.user_id`))
+      .where(eq(schema.caroRooms.roomCode, roomCode))
+      .limit(1)
 
-    if (result.rows.length === 0) {
+    if (roomResult.length === 0) {
       return res.status(404).json({ error: "Room not found" })
     }
 
-    const room = result.rows[0]
+    const room = roomResult[0]
 
     // Get all moves for this game
-    const movesResult = await query(
-      `SELECT cm.*, u.username as player_username
-       FROM caro_moves cm
-       JOIN users u ON cm.player_id = u.id
-       WHERE cm.game_id = $1
-       ORDER BY cm.move_number ASC`,
-      [room.game_id]
-    )
+    const movesResult = await db
+      .select({
+        id: schema.caroMoves.id,
+        gameId: schema.caroMoves.gameId,
+        playerId: schema.caroMoves.playerId,
+        row: schema.caroMoves.x,
+        col: schema.caroMoves.y,
+        moveNumber: schema.caroMoves.moveNumber,
+        createdAt: schema.caroMoves.createdAt,
+        playerUsername: sql`u.username`.as('player_username')
+      })
+      .from(schema.caroMoves)
+      .innerJoin(sql`users u`, eq(schema.caroMoves.playerId, sql`u.id`))
+      .where(eq(schema.caroMoves.gameId, room.gameId))
+      .orderBy(schema.caroMoves.moveNumber)
 
     // Build board state from moves
     const board = {}
-    movesResult.rows.forEach(move => {
+    movesResult.forEach(move => {
       const key = `${move.row}-${move.col}`
-      board[key] = move.player_id === room.player1_id ? 1 : 2
+      board[key] = move.playerId === room.player1Id ? 1 : 2
     })
 
     res.json({ 
       room: {
         ...room,
         board_state: board,
-        moves: movesResult.rows
+        moves: movesResult
       }
     })
   } catch (error) {
-    console.error("[v0] Get room error:", error)
+    console.error("[Caro] Get room error:", error)
     res.status(500).json({ error: "Failed to get room info" })
   }
 })
 
 // Make move
 router.post("/move", authMiddleware, async (req, res) => {
-  const client = await getClient()
-  
   try {
     const { roomCode, x, y, player } = req.body
 
-    await client.query("BEGIN")
+    const result = await db.transaction(async (tx) => {
+      // Get room and game
+      const roomResult = await tx
+        .select({
+          roomId: sql`${schema.caroRooms.id}`.as('room_id'),
+          roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+          roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+          gameId: sql`${schema.caroGames.id}`.as('game_id'),
+          player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+          player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+          currentPlayer: sql`${schema.caroGames.currentPlayer}`.as('current_player'),
+          gameStatus: sql`${schema.caroGames.status}`.as('game_status'),
+          betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+          timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
+          player1TimeLeft: sql`${schema.caroGames.player1TimeLeft}`.as('player1_time_left'),
+          player2TimeLeft: sql`${schema.caroGames.player2TimeLeft}`.as('player2_time_left'),
+          lastMoveTime: sql`${schema.caroGames.lastMoveTime}`.as('last_move_time')
+        })
+        .from(schema.caroRooms)
+        .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+        .where(
+          and(
+            eq(schema.caroRooms.roomCode, roomCode),
+            eq(schema.caroRooms.status, "playing")
+          )
+        )
+        .limit(1)
 
-    // Get room and game
-    const roomResult = await client.query(
-      `SELECT cr.*, cg.*
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       WHERE cr.room_code = $1 AND cr.status = 'playing'`,
-      [roomCode]
-    )
+      if (roomResult.length === 0) {
+        throw new Error("Room not found or game not in progress")
+      }
 
-    if (roomResult.rows.length === 0) {
-      await client.query("ROLLBACK")
-      return res.status(404).json({ error: "Room not found or game not in progress" })
-    }
+      const game = roomResult[0]
 
-    const game = roomResult.rows[0]
+      // Verify it's the player's turn
+      if (game.currentPlayer !== player) {
+        throw new Error("Not your turn")
+      }
 
-    // Verify it's the player's turn
-    if (game.current_player !== player) {
-      await client.query("ROLLBACK")
-      return res.status(400).json({ error: "Not your turn" })
-    }
+      // Check time limit if enabled
+      let timeExpired = false
+      let updatedPlayer1Time = game.player1TimeLeft
+      let updatedPlayer2Time = game.player2TimeLeft
 
-    // Get current move number
-    const moveCountResult = await client.query(
-      "SELECT COUNT(*) as count FROM caro_moves WHERE game_id = $1",
-      [game.id]
-    )
-    const moveNumber = parseInt(moveCountResult.rows[0].count) + 1
+      if (game.timeLimitMinutes && game.lastMoveTime) {
+        const now = new Date()
+        const lastMove = new Date(game.lastMoveTime)
+        const elapsedSeconds = Math.floor((now - lastMove) / 1000)
 
-    // Insert move
-    const playerId = player === 1 ? game.player1_id : game.player2_id
-    await client.query(
-      `INSERT INTO caro_moves (game_id, player_id, row, col, move_number)
-       VALUES ($1, $2, $3, $4, $5)`,
-      [game.id, playerId, x, y, moveNumber]
-    )
+        if (player === 1 && game.player1TimeLeft !== null) {
+          updatedPlayer1Time = game.player1TimeLeft - elapsedSeconds
+          if (updatedPlayer1Time <= 0) {
+            timeExpired = true
+          }
+        } else if (player === 2 && game.player2TimeLeft !== null) {
+          updatedPlayer2Time = game.player2TimeLeft - elapsedSeconds
+          if (updatedPlayer2Time <= 0) {
+            timeExpired = true
+          }
+        }
+      }
 
-    // Get all moves to check winner
-    const movesResult = await client.query(
-      `SELECT * FROM caro_moves WHERE game_id = $1 ORDER BY move_number ASC`,
-      [game.id]
-    )
+      // If time expired, opponent wins
+      if (timeExpired) {
+        const winnerId = player === 1 ? game.player2Id : game.player1Id
+        const loserId = player === 1 ? game.player1Id : game.player2Id
+        
+        const winnings = await handleGameEnd(tx, game, winnerId, loserId, roomCode, 'timeout')
+        
+        return { 
+          winner: player === 1 ? 2 : 1, 
+          reason: 'timeout',
+          winnings,
+          winnerId,
+          loserId
+        }
+      }
 
-    // Build board from moves
-    const board = {}
-    movesResult.rows.forEach(move => {
-      const key = `${move.row}-${move.col}`
-      board[key] = move.player_id === game.player1_id ? 1 : 2
-    })
+      // Get current move number
+      const moveCountResult = await tx
+        .select({ count: sql`COUNT(*)`.as('count') })
+        .from(schema.caroMoves)
+        .where(eq(schema.caroMoves.gameId, game.gameId))
 
-    // Check for winner
-    const winner = checkWinner(board, x, y, player, game.win_condition || 5)
+      const moveNumber = parseInt(moveCountResult[0].count) + 1
 
-    if (winner) {
-      // Game finished
-      const winnerId = player === 1 ? game.player1_id : game.player2_id
-      const loserId = player === 1 ? game.player2_id : game.player1_id
+      // Insert move
+      const playerId = player === 1 ? game.player1Id : game.player2Id
+      await tx
+        .insert(schema.caroMoves)
+        .values({
+          gameId: game.gameId,
+          playerId,
+          x,
+          y,
+          moveNumber
+        })
 
-      await client.query(
-        `UPDATE caro_games 
-         SET status = 'finished', winner_id = $1, finished_at = NOW()
-         WHERE id = $2`,
-        [winnerId, game.id]
-      )
+      // Update last move time and player times
+      await tx
+        .update(schema.caroGames)
+        .set({
+          lastMoveTime: new Date(),
+          player1TimeLeft: updatedPlayer1Time,
+          player2TimeLeft: updatedPlayer2Time
+        })
+        .where(eq(schema.caroGames.id, game.gameId))
 
-      await client.query(
-        `UPDATE caro_rooms 
-         SET status = 'finished', finished_at = NOW()
-         WHERE room_code = $1`,
-        [roomCode]
-      )
+      // Get all moves to check winner
+      const movesResult = await tx
+        .select()
+        .from(schema.caroMoves)
+        .where(eq(schema.caroMoves.gameId, game.gameId))
+        .orderBy(schema.caroMoves.moveNumber)
 
-      // Calculate winnings
-      const totalPot = game.bet_amount * 2
-      const winnings = totalPot * 0.8
-
-      // Update wallets
-      await client.query("UPDATE wallets SET balance = balance + $1 WHERE user_id = $2", [winnings, winnerId])
-      
-      // Record transactions
-      await client.query(
-        "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
-        [winnerId, winnings, "game_win", "caro", `Won caro game in room ${roomCode}`]
-      )
-      await client.query(
-        "INSERT INTO transactions (user_id, amount, type, source, description) VALUES ($1, $2, $3, $4, $5)",
-        [loserId, -game.bet_amount, "game_loss", "caro", `Lost caro game in room ${roomCode}`]
-      )
-
-      // Update stats
-      await client.query(
-        `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
-         VALUES ($1, 1, 1, $2)
-         ON CONFLICT (user_id) 
-         DO UPDATE SET 
-           games_played = caro_stats.games_played + 1,
-           games_won = caro_stats.games_won + 1,
-           total_earnings = caro_stats.total_earnings + $2`,
-        [winnerId, winnings]
-      )
-      await client.query(
-        `INSERT INTO caro_stats (user_id, games_played, games_won, total_earnings)
-         VALUES ($1, 1, 0, $2)
-         ON CONFLICT (user_id) 
-         DO UPDATE SET 
-           games_played = caro_stats.games_played + 1,
-           total_earnings = caro_stats.total_earnings + $2`,
-        [loserId, -game.bet_amount]
-      )
-
-      await client.query("COMMIT")
-
-      // Emit socket event
-      const io = req.app.get("io")
-      io.to(`caro:${roomCode}`).emit("caro:game-finished", { 
-        winner: player, 
-        winnings,
-        winnerId,
-        loserId
+      // Build board from moves
+      const board = {}
+      movesResult.forEach(move => {
+        const key = `${move.x}-${move.y}`
+        board[key] = move.playerId === game.player1Id ? 1 : 2
       })
 
-      res.json({ winner: player, winnings })
+      // Check for winner (default win condition is 5)
+      const winCondition = 5
+      const winner = checkWinner(board, x, y, player, winCondition)
+
+      if (winner) {
+        // Game finished
+        const winnerId = player === 1 ? game.player1Id : game.player2Id
+        const loserId = player === 1 ? game.player2Id : game.player1Id
+
+        const winnings = await handleGameEnd(tx, game, winnerId, loserId, roomCode, 'win')
+
+        return { winner: player, winnings, winnerId, loserId }
+      } else {
+        // Continue game - switch player
+        const nextPlayer = game.currentPlayer === 1 ? 2 : 1
+        await tx
+          .update(schema.caroGames)
+          .set({ currentPlayer: nextPlayer })
+          .where(eq(schema.caroGames.id, game.gameId))
+
+        return { 
+          success: true, 
+          nextPlayer,
+          player1TimeLeft: updatedPlayer1Time,
+          player2TimeLeft: updatedPlayer2Time
+        }
+      }
+    })
+
+    // Emit socket event
+    const io = req.app.get("io")
+    if (result.winner) {
+      io.to(`caro:${roomCode}`).emit("caro:game-finished", result)
     } else {
-      // Continue game - switch player
-      const nextPlayer = game.current_player === 1 ? 2 : 1
-      await client.query(
-        "UPDATE caro_games SET current_player = $1 WHERE id = $2",
-        [nextPlayer, game.id]
-      )
-
-      await client.query("COMMIT")
-
-      // Emit socket event
-      const io = req.app.get("io")
       io.to(`caro:${roomCode}`).emit("caro:move-made", { 
         x, 
         y, 
         player,
-        nextPlayer
+        nextPlayer: result.nextPlayer,
+        player1TimeLeft: result.player1TimeLeft,
+        player2TimeLeft: result.player2TimeLeft
       })
-
-      res.json({ success: true, nextPlayer })
     }
+
+    res.json(result)
   } catch (error) {
-    await client.query("ROLLBACK")
-    console.error("[v0] Move error:", error)
-    res.status(500).json({ error: "Failed to make move" })
-  } finally {
-    client.release()
+    console.error("[Caro] Move error:", error)
+    const statusCode = error.message === "Room not found or game not in progress" ? 404 :
+                       error.message === "Not your turn" ? 400 : 500
+    res.status(statusCode).json({ error: error.message || "Failed to make move" })
   }
 })
+
+// Helper function to handle game end
+async function handleGameEnd(tx, game, winnerId, loserId, roomCode, reason) {
+  await tx
+    .update(schema.caroGames)
+    .set({ 
+      status: "finished", 
+      winnerId,
+      finishedAt: new Date()
+    })
+    .where(eq(schema.caroGames.id, game.gameId))
+
+  await tx
+    .update(schema.caroRooms)
+    .set({ 
+      status: "finished",
+      finishedAt: new Date()
+    })
+    .where(eq(schema.caroRooms.roomCode, roomCode))
+
+  // Calculate winnings
+  const betAmount = parseFloat(game.betAmount)
+  const totalPot = betAmount * 2
+  const winnings = totalPot * 0.8
+
+  // Update wallets
+  await tx
+    .update(schema.wallets)
+    .set({ 
+      balance: sql`${schema.wallets.balance} + ${winnings}`,
+      updatedAt: new Date()
+    })
+    .where(eq(schema.wallets.userId, winnerId))
+  
+  // Record transactions
+  await tx
+    .insert(schema.transactions)
+    .values({
+      userId: winnerId,
+      amount: winnings.toString(),
+      type: "game_win",
+      source: "caro",
+      description: `Won caro game in room ${roomCode}${reason === 'timeout' ? ' (opponent timeout)' : ''}`
+    })
+
+  await tx
+    .insert(schema.transactions)
+    .values({
+      userId: loserId,
+      amount: (-betAmount).toString(),
+      type: "game_loss",
+      source: "caro",
+      description: `Lost caro game in room ${roomCode}${reason === 'timeout' ? ' (timeout)' : ''}`
+    })
+
+  // Update stats
+  await tx
+    .insert(schema.caroStats)
+    .values({
+      userId: winnerId,
+      gamesPlayed: 1,
+      gamesWon: 1,
+      totalEarnings: winnings.toString()
+    })
+    .onConflictDoUpdate({
+      target: schema.caroStats.userId,
+      set: {
+        gamesPlayed: sql`${schema.caroStats.gamesPlayed} + 1`,
+        gamesWon: sql`${schema.caroStats.gamesWon} + 1`,
+        totalEarnings: sql`${schema.caroStats.totalEarnings} + ${winnings}`,
+        updatedAt: new Date()
+      }
+    })
+
+  await tx
+    .insert(schema.caroStats)
+    .values({
+      userId: loserId,
+      gamesPlayed: 1,
+      gamesWon: 0,
+      totalEarnings: (-betAmount).toString()
+    })
+    .onConflictDoUpdate({
+      target: schema.caroStats.userId,
+      set: {
+        gamesPlayed: sql`${schema.caroStats.gamesPlayed} + 1`,
+        totalEarnings: sql`${schema.caroStats.totalEarnings} + ${-betAmount}`,
+        updatedAt: new Date()
+      }
+    })
+
+  return winnings
+}
 
 // Check for winner (N in a row)
 function checkWinner(board, lastX, lastY, player, winCondition = 5) {
@@ -415,21 +546,31 @@ function checkWinner(board, lastX, lastY, player, winCondition = 5) {
 // Get available rooms
 router.get("/rooms", authMiddleware, async (req, res) => {
   try {
-    const result = await query(
-      `SELECT cr.room_code, cr.status as room_status, cr.created_at,
-              cg.id as game_id, cg.player1_id, cg.bet_amount, cg.board_size, cg.win_condition,
-              u.username as player1_username
-       FROM caro_rooms cr
-       JOIN caro_games cg ON cr.id = cg.room_id
-       JOIN users u ON cg.player1_id = u.id
-       WHERE cr.status = 'waiting'
-       ORDER BY cr.created_at DESC
-       LIMIT 20`,
-    )
-    console.log("[v0] Fetched rooms:", result.rows)
-    res.json({ rooms: result.rows })
+    const rooms = await db
+      .select({
+        roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+        roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+        createdAt: sql`${schema.caroRooms.createdAt}`.as('created_at'),
+        gameId: sql`${schema.caroGames.id}`.as('game_id'),
+        player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+        player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+        betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+        currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+        timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
+        winCondition: sql`5`.as('win_condition'),
+        player1Username: sql`u.username`.as('player1_username')
+      })
+      .from(schema.caroRooms)
+      .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+      .innerJoin(sql`users u`, eq(schema.caroGames.player1Id, sql`u.id`))
+      .where(eq(schema.caroRooms.status, "waiting"))
+      .orderBy(desc(schema.caroRooms.createdAt))
+      .limit(20)
+
+    console.log("[Caro] Fetched rooms:", rooms.length)
+    res.json({ rooms })
   } catch (error) {
-    console.error("Get rooms error:", error)
+    console.error("[Caro] Get rooms error:", error)
     res.status(500).json({ error: "Failed to get rooms" })
   }
 })

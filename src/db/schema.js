@@ -96,8 +96,13 @@ const caroGames = pgTable('caro_games', {
   winnerId: integer('winner_id').references(() => users.id, { onDelete: 'set null' }),
   betAmount: decimal('bet_amount', { precision: 10, scale: 2 }).notNull(),
   boardState: jsonb('board_state').default({}).notNull(),
-  currentTurn: integer('current_turn').default(1).notNull(),
+  currentPlayer: integer('current_player').default(1).notNull(),
   status: varchar('status', { length: 20 }).default('waiting').notNull(),
+  timeLimitMinutes: integer('time_limit_minutes'),
+  player1TimeLeft: integer('player1_time_left'),
+  player2TimeLeft: integer('player2_time_left'),
+  lastMoveTime: timestamp('last_move_time'),
+  currentPlayerCount: integer('current_player_count').default(0).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   finishedAt: timestamp('finished_at')
 });
