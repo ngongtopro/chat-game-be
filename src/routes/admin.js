@@ -191,11 +191,9 @@ router.get("/caro/rooms", async (req, res) => {
         id: caroRooms.id,
         roomCode: caroRooms.roomCode,
         status: caroRooms.status,
+        maxUsers: caroRooms.maxUsers,
+        betAmount: caroRooms.betAmount,
         createdAt: caroRooms.createdAt,
-        finishedAt: caroRooms.finishedAt,
-        player1Username: sql`u1.username`.as('player1_username'),
-        player2Username: sql`u2.username`.as('player2_username'),
-        betAmount: caroGames.betAmount,
         gameStatus: caroGames.status
       })
       .from(caroRooms)

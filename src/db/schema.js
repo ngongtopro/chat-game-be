@@ -81,6 +81,9 @@ const caroRooms = pgTable('caro_rooms', {
   id: serial('id').primaryKey(),
   roomCode: varchar('room_code', { length: 20 }).notNull().unique(),
   status: varchar('status', { length: 20 }).default('waiting').notNull(),
+  betAmount: decimal('bet_amount', { precision: 10, scale: 2 }).notNull(),
+  maxUsers: integer('max_users').default(2).notNull(),
+  currentUsers: jsonb('current_users').default([]).notNull(),
   createdAt: timestamp('created_at').defaultNow().notNull(),
   finishedAt: timestamp('finished_at')
 });

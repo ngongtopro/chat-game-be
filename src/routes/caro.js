@@ -1,7 +1,7 @@
 const express = require("express")
 const { db } = require("../db/helpers")
 const { authMiddleware } = require("../auth")
-const { eq, and, or, sql, desc, isNull } = require("drizzle-orm")
+const { eq, and, or, sql, desc, isNull, max } = require("drizzle-orm")
 const schema = require("../db/schema")
 
 const router = express.Router()
@@ -98,6 +98,82 @@ router.post("/join-room", authMiddleware, async (req, res) => {
                        error.message === "Room is full" ? 400 : 500
     res.status(statusCode).json({ 
       error: error.message || "Failed to join room" 
+    })
+  }
+})
+
+// Leave game room
+router.post("/leave-room", authMiddleware, async (req, res) => {
+  try {
+    const { roomCode } = req.body
+    console.log(`[Caro] User ${req.userId} leaving room ${roomCode}`)
+    
+    const result = await db.transaction(async (tx) => {
+      // Get room and game info
+      const roomResult = await tx
+        .select({
+          roomId: sql`${schema.caroRooms.id}`.as('room_id'),
+          roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+          roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+          gameId: sql`${schema.caroGames.id}`.as('game_id'),
+          player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+          player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+          currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+          gameStatus: sql`${schema.caroGames.status}`.as('game_status')
+        })
+        .from(schema.caroRooms)
+        .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+        .where(eq(schema.caroRooms.roomCode, roomCode))
+        .limit(1)
+
+      if (roomResult.length === 0) {
+        throw new Error("Room not found")
+      }
+
+      const game = roomResult[0]
+
+      // Check if user is in this room
+      if (game.player1Id !== req.userId && game.player2Id !== req.userId) {
+        throw new Error("You are not in this room")
+      }
+
+      // Don't allow leaving if game is in progress
+      if (game.gameStatus === "playing") {
+        throw new Error("Cannot leave room while game is in progress")
+      }
+
+      // Decrease player count
+      const newCount = Math.max(0, game.currentPlayerCount - 1)
+      await tx
+        .update(schema.caroGames)
+        .set({ currentPlayerCount: newCount })
+        .where(eq(schema.caroGames.id, game.gameId))
+
+      // If room becomes empty and game hasn't started, reset player2
+      if (newCount === 0 && game.gameStatus === "waiting") {
+        await tx
+          .update(schema.caroGames)
+          .set({ player2Id: null })
+          .where(eq(schema.caroGames.id, game.gameId))
+      }
+
+      return { success: true, currentPlayerCount: newCount }
+    })
+
+    // Broadcast room update to lobby
+    const io = req.app.get("io")
+    io.to("caro:lobby").emit("caro:room-updated", { roomCode, ...result })
+    
+    console.log(`[Caro] User ${req.userId} left room ${roomCode}`)
+    
+    res.json(result)
+  } catch (error) {
+    console.error("[Caro] Leave room error:", error)
+    const statusCode = error.message === "Room not found" ? 404 :
+                       error.message === "You are not in this room" ? 400 :
+                       error.message === "Cannot leave room while game is in progress" ? 400 : 500
+    res.status(statusCode).json({ 
+      error: error.message || "Failed to leave room" 
     })
   }
 })
@@ -437,6 +513,12 @@ async function handleGameEnd(tx, game, winnerId, loserId, roomCode, reason) {
     })
     .where(eq(schema.caroRooms.roomCode, roomCode))
 
+  // Reset player count so room is no longer available
+  await tx
+    .update(schema.caroGames)
+    .set({ currentPlayerCount: 0 })
+    .where(eq(schema.caroGames.id, game.gameId))
+
   // Calculate winnings
   const betAmount = parseFloat(game.betAmount)
   const totalPot = betAmount * 2
@@ -545,25 +627,27 @@ function checkWinner(board, lastX, lastY, player, winCondition = 5) {
 
 // Get available rooms
 router.get("/rooms", authMiddleware, async (req, res) => {
+  console.log("[Caro] Fetching available rooms")
   try {
     const rooms = await db
       .select({
         roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
-        roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
-        createdAt: sql`${schema.caroRooms.createdAt}`.as('created_at'),
-        gameId: sql`${schema.caroGames.id}`.as('game_id'),
-        player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
-        player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
-        betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
         currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
-        timeLimitMinutes: sql`${schema.caroGames.timeLimitMinutes}`.as('time_limit_minutes'),
-        winCondition: sql`5`.as('win_condition'),
-        player1Username: sql`u.username`.as('player1_username')
+        maxPlayers: sql`2`.as('max_players'),
+        betAmount: sql`${schema.caroGames.betAmount}`.as('bet_amount'),
+        currentUsers: sql`${schema.caroRooms.currentUsers}`.as('current_users'),
       })
       .from(schema.caroRooms)
-      .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
-      .innerJoin(sql`users u`, eq(schema.caroGames.player1Id, sql`u.id`))
-      .where(eq(schema.caroRooms.status, "waiting"))
+      .leftJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+      .where(
+        and(
+          eq(schema.caroRooms.status, "waiting"),
+          or(
+            isNull(schema.caroGames.currentPlayerCount),
+            sql`${schema.caroGames.currentPlayerCount} < 2`
+          )
+        )
+      )
       .orderBy(desc(schema.caroRooms.createdAt))
       .limit(20)
 
@@ -572,6 +656,82 @@ router.get("/rooms", authMiddleware, async (req, res) => {
   } catch (error) {
     console.error("[Caro] Get rooms error:", error)
     res.status(500).json({ error: "Failed to get rooms" })
+  }
+})
+
+// Leave game room
+router.post("/leave-room", authMiddleware, async (req, res) => {
+  try {
+    const { roomCode } = req.body
+    console.log(`[Caro] User ${req.userId} leaving room ${roomCode}`)
+    
+    const result = await db.transaction(async (tx) => {
+      // Get room and game info
+      const roomResult = await tx
+        .select({
+          roomId: sql`${schema.caroRooms.id}`.as('room_id'),
+          roomCode: sql`${schema.caroRooms.roomCode}`.as('room_code'),
+          roomStatus: sql`${schema.caroRooms.status}`.as('room_status'),
+          gameId: sql`${schema.caroGames.id}`.as('game_id'),
+          player1Id: sql`${schema.caroGames.player1Id}`.as('player1_id'),
+          player2Id: sql`${schema.caroGames.player2Id}`.as('player2_id'),
+          currentPlayerCount: sql`${schema.caroGames.currentPlayerCount}`.as('current_player_count'),
+          gameStatus: sql`${schema.caroGames.status}`.as('game_status')
+        })
+        .from(schema.caroRooms)
+        .innerJoin(schema.caroGames, eq(schema.caroRooms.id, schema.caroGames.roomId))
+        .where(eq(schema.caroRooms.roomCode, roomCode))
+        .limit(1)
+
+      if (roomResult.length === 0) {
+        throw new Error("Room not found")
+      }
+
+      const game = roomResult[0]
+
+      // Check if user is in this room
+      if (game.player1Id !== req.userId && game.player2Id !== req.userId) {
+        throw new Error("You are not in this room")
+      }
+
+      // Don't allow leaving if game is in progress
+      if (game.gameStatus === "playing") {
+        throw new Error("Cannot leave room while game is in progress")
+      }
+
+      // Decrease player count
+      const newCount = Math.max(0, game.currentPlayerCount - 1)
+      await tx
+        .update(schema.caroGames)
+        .set({ currentPlayerCount: newCount })
+        .where(eq(schema.caroGames.id, game.gameId))
+
+      // If room becomes empty and game hasn't started, reset player2
+      if (newCount === 0 && game.gameStatus === "waiting") {
+        await tx
+          .update(schema.caroGames)
+          .set({ player2Id: null })
+          .where(eq(schema.caroGames.id, game.gameId))
+      }
+
+      return { success: true, currentPlayerCount: newCount }
+    })
+
+    // Broadcast room update to lobby
+    const io = req.app.get("io")
+    io.to("caro:lobby").emit("caro:room-updated", { roomCode, ...result })
+    
+    console.log(`[Caro] User ${req.userId} left room ${roomCode}`)
+    
+    res.json(result)
+  } catch (error) {
+    console.error("[Caro] Leave room error:", error)
+    const statusCode = error.message === "Room not found" ? 404 :
+                       error.message === "You are not in this room" ? 400 :
+                       error.message === "Cannot leave room while game is in progress" ? 400 : 500
+    res.status(statusCode).json({ 
+      error: error.message || "Failed to leave room" 
+    })
   }
 })
 
