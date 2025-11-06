@@ -220,22 +220,45 @@ router.get("/caro/rooms", async (req, res) => {
 // Create caro room (admin only)
 router.post("/caro/rooms", async (req, res) => {
   try {
-    const { betAmount = 10 } = req.body
+    const { betAmount = 10, maxUsers = 2 } = req.body
+    
+    // Validate inputs
+    const bet = parseFloat(betAmount)
+    const max = parseInt(maxUsers)
+    
+    if (isNaN(bet) || bet < 0) {
+      return res.status(400).json({ error: "Invalid bet amount" })
+    }
+    
+    if (isNaN(max) || max < 2 || max > 10) {
+      return res.status(400).json({ error: "Invalid max users (2-10 allowed)" })
+    }
+    
     // Generate unique room code
     const roomCode = `${Date.now().toString(36).toUpperCase()}`
-    // Create room
+    
+    // Create room with betAmount and maxUsers
     const [room] = await db
       .insert(caroRooms)
       .values({
         roomCode,
-        status: 'waiting'
+        status: 'waiting',
+        betAmount: bet.toString(),
+        maxUsers: max,
+        currentUsers: []
       })
       .returning()
 
     res.json({
       message: "Room created successfully",
       room: {
-        ...room,
+        id: room.id,
+        roomCode: room.roomCode,
+        status: room.status,
+        betAmount: room.betAmount,
+        maxUsers: room.maxUsers,
+        currentUsers: room.currentUsers,
+        createdAt: room.createdAt
       }
     })
   } catch (error) {
